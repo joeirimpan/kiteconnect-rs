@@ -5,18 +5,21 @@
 //         unstable_features,
 //         unused_import_braces, unused_qualifications)]
 //
-use std::thread;
+use std::{thread, time};
 use std::io::{Cursor, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use log::debug;
+
+use anyhow::{anyhow, Result};
 use ws::{
-    Handler, Handshake, Message, Sender, CloseCode, Result, Error,
+    Handler, Handshake, Message, Sender, CloseCode, Error,
     Request, Factory, WebSocket
 };
 use byteorder::{BigEndian, ReadBytesExt};
 use url;
 use serde_json::{json, Value as JsonValue};
+
 
 /// KiteTickerHandler lets the user write the business logic inside
 /// the corresponding callbacks which are basically proxied from the
@@ -45,8 +48,10 @@ pub trait KiteTickerHandler {
 }
 
 
+#[derive(Clone)]
 struct WebSocketFactory<T> where T: KiteTickerHandler {
-    handler: Arc<Mutex<Box<T>>>
+    handler: Arc<Mutex<Box<T>>>,
+    url: url::Url
 }
 
 
@@ -57,25 +62,33 @@ impl<T> Factory for WebSocketFactory<T> where T: KiteTickerHandler {
 
     fn connection_made(&mut self, ws: Sender) -> WebSocketHandler<T> {
         WebSocketHandler {
-            ws: Some(ws),
+            ws: ws,
             handler: self.handler.clone(),
+            url: self.url.clone(),
             subscribed_tokens: HashMap::new()
         }
     }
 
     fn client_connected(&mut self, ws: Sender) -> WebSocketHandler<T> {
         WebSocketHandler {
-            ws: Some(ws),
+            ws: ws,
             handler: self.handler.clone(),
+            url: self.url.clone(),
             subscribed_tokens: HashMap::new()
         }
+    }
+
+    fn connection_lost(&mut self, _: Self::Handler) {
+        println!("connection lost?");
     }
 }
 
 
+#[derive(Clone)]
 pub struct WebSocketHandler<T> where T: KiteTickerHandler {
     handler: Arc<Mutex<Box<T>>>,
-    ws: Option<Sender>,
+    ws: Sender,
+    url: url::Url,
     subscribed_tokens: HashMap<u32, String>
 }
 
@@ -92,15 +105,8 @@ impl<T> WebSocketHandler<T> where T: KiteTickerHandler {
             self.subscribed_tokens.insert(*token, "quote".to_string());
         }
 
-        match self.ws {
-            Some(ref s) => {
-                s.send(data.to_string())?;
-                Ok(())
-            },
-            None => {
-                Ok(debug!("Sender not bound to the instance"))
-            }
-        }
+        self.ws.send(data.to_string())?;
+        Ok(())
     }
 
     /// Unsubscribe the given list of instrument_tokens
@@ -114,15 +120,8 @@ impl<T> WebSocketHandler<T> where T: KiteTickerHandler {
             self.subscribed_tokens.remove(token);
         }
 
-        match self.ws {
-            Some(ref s) => {
-                s.send(data.to_string())?;
-                Ok(())
-            },
-            None => {
-                Ok(debug!("Sender not bound to the instance"))
-            }
-        }
+        self.ws.send(data.to_string())?;
+        Ok(())
     }
 
     /// Resubscribe to all current subscribed tokens
@@ -152,15 +151,8 @@ impl<T> WebSocketHandler<T> where T: KiteTickerHandler {
             *self.subscribed_tokens.entry(*token).or_insert("".to_string()) = mode.to_string();
         }
 
-        match self.ws {
-            Some(ref s) => {
-                s.send(data.to_string())?;
-                Ok(())
-            }
-            None => {
-                Ok(debug!("Sender not bound to the instance"))
-            }
-        }
+        self.ws.send(data.to_string())?;
+        Ok(())
     }
 }
 
@@ -168,20 +160,20 @@ impl<T> WebSocketHandler<T> where T: KiteTickerHandler {
 /// callbacks methods ws-rs library
 impl<T> Handler for WebSocketHandler<T> where T: KiteTickerHandler {
 
-    fn build_request(&mut self, url: &url::Url) -> Result<Request> {
+    fn build_request(&mut self, url: &url::Url) -> ws::Result<Request> {
         let mut req = Request::from_url(url)?;
         req.headers_mut().push(("X-Kite-Version".into(), "3".into()));
         Ok(req)
     }
 
-    fn on_open(&mut self, _shake: Handshake) -> Result<()> {
+    fn on_open(&mut self, _shake: Handshake) -> ws::Result<()> {
         let cloned_handler = self.handler.clone();
         cloned_handler.lock().unwrap().on_open(self);
         debug!("Connection opened!");
         Ok(())
     }
 
-    fn on_message(&mut self, msg: Message) -> Result<()> {
+    fn on_message(&mut self, msg: Message) -> ws::Result<()> {
         if msg.is_binary() && msg.len() > 2 {
             let mut reader = Cursor::new(msg.clone().into_data());
             let number_of_packets = reader.read_i16::<BigEndian>().unwrap();
@@ -331,17 +323,29 @@ impl<T> Handler for WebSocketHandler<T> where T: KiteTickerHandler {
         debug!("Connection closed {:?}", code);
     }
 
-    fn on_error(&mut self, err: Error) {
-        let cloned_handler = self.handler.clone();
-        cloned_handler.lock().unwrap().on_error(self);
-        debug!("Error {:?}", err);
+    // fn on_error(&mut self, err: Error) {
+    //     // // Send close frame and try reconnecting?
+    //     // // TODO: Add backoff
+    //     // println!("Reconnecting to {}", self.url.as_str());
+
+    //     // self.ws.close(ws::CloseCode::Abnormal);
+    //     // self.ws.connect(self.url.clone());
+
+    //     // thread::sleep(time::Duration::from_secs(2));
+    //     println!("Error {:?}", err);
+
+    //     let cloned_handler = self.handler.clone();
+    //     cloned_handler.lock().unwrap().on_error(self);
+    // }
+
+    fn on_shutdown(&mut self) {
+        println!("Shutdown");
     }
 
 }
 
 
 pub struct KiteTicker {
-    sender: Option<Sender>,
     api_key: String,
     access_token: String,
 }
@@ -353,7 +357,6 @@ impl KiteTicker {
     /// Constructor
     pub fn new(api_key: &str, access_token: &str) -> KiteTicker {
         KiteTicker {
-            sender: None,
             api_key: api_key.to_string(),
             access_token: access_token.to_string(),
         }
@@ -362,12 +365,7 @@ impl KiteTicker {
     /// Creates a websocket and delegates to it to child thread. Also sets the
     /// broadcaster so that other methods can easily send message on this socket
     pub fn connect<F>(&mut self, handler: F, uri: Option<&str>) -> Result<()>
-        where F: KiteTickerHandler + Send + 'static {
-        let factory = WebSocketFactory {
-            handler: Arc::new(Mutex::new(Box::new(handler)))
-        };
-        let mut ws = WebSocket::new(factory).unwrap();
-        let sender = ws.broadcaster();
+        where F: KiteTickerHandler + Send + Clone + 'static {
         let socket_url = format!(
             "wss://{}?api_key={}&access_token={}",
             match uri {
@@ -379,46 +377,87 @@ impl KiteTicker {
         );
         let url = url::Url::parse(socket_url.as_str()).unwrap();
 
-        ws.connect(url.clone()).unwrap();
-        thread::spawn(|| ws.run().unwrap());
+        thread::spawn(move || {
+            loop {
+                println!("initial connection");
 
-        self.sender = Some(sender);
+                let settings = {
+                    let mut settings = ws::Settings::default();
+                    settings.tcp_nodelay = true;
+                    settings.panic_on_internal = false;
+                    settings
+                };
+
+                let factory = WebSocketFactory {
+                    handler: Arc::new(Mutex::new(Box::new(handler.clone()))),
+                    url: url.clone(),
+                };
+
+                match ws::Builder::new().with_settings(settings).build(factory) {
+                    Ok(mut ws) => {
+                        match ws.connect(url.clone()) {
+                            Ok(_) => {
+                                match ws.run() {
+                                    Ok(_) => {
+                                        println!("graceful exit");
+                                    },
+                                    Err(e) => {
+                                        println!("error during ws.run {:?}", e);
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                println!("error during ws.connect {:?}", e);
+                            },
+                        };
+                    },
+                    Err(e) => {
+                        println!("error during WebSocket::new {:?}", e);
+                    },
+                }
+
+                thread::sleep(time::Duration::from_secs(10));
+                println!("attempting reconnection");
+            }
+        });
+
+        // self.sender = Some(sender);
 
         Ok(())
     }
 
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
 
-    use ws::listen;
+//     use ws::listen;
 
-    struct Server {
-        out: Sender,
-    }
+//     struct Server {
+//         out: Sender,
+//     }
 
-    impl Handler for Server {
-        fn on_message(&mut self, msg: Message) -> Result<()> {
-            let message = msg.clone();
-            assert_eq!(message.into_text().unwrap(), "PING".to_string());
-            self.out.send(msg)
-        }
-    }
+//     impl Handler for Server {
+//         fn on_message(&mut self, msg: Message) -> ws::Result<()> {
+//             let message = msg.clone();
+//             assert_eq!(message.into_text().unwrap(), "PING".to_string());
+//             self.out.send(msg)
+//         }
+//     }
 
-    #[test]
-    fn test_kite_ticker() {
-        thread::spawn(move || {
-            listen("127.0.0.1:3012", |out| {
-                Server { out: out }
-            }).unwrap()
-        });
+//     #[test]
+//     fn test_kite_ticker() {
+//         thread::spawn(move || {
+//             listen("127.0.0.1:3012", |out| {
+//                 Server { out: out }
+//             }).unwrap()
+//         });
 
-        struct MyHandler;
-        impl KiteTickerHandler for MyHandler {}
-        let mut kiteticker = KiteTicker::new("<API-KEY>", "<ACCESS-TOKEN>");
-        kiteticker.connect(MyHandler{}, Some("127.0.0.1:3012"));
-        kiteticker.sender.unwrap().send("PING");
-    }
-}
+//         struct MyHandler;
+//         impl KiteTickerHandler for MyHandler {}
+//         let mut kiteticker = KiteTicker::new("<API-KEY>", "<ACCESS-TOKEN>");
+//         kiteticker.connect(MyHandler{}, Some("127.0.0.1:3012"));
+//         kiteticker.sender.unwrap().send("PING");
+//     }
+// }
